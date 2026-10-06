@@ -763,9 +763,11 @@ footer{text-align:center;font-size:12px;color:var(--ink-soft);padding:26px 0 34p
 
 <!-- ================= 左下气泡指引 ================= -->
 <div class="guide" id="guide">
-  <div class="g-chip" id="gChip" role="img" aria-label="昕怡" title="把鼠标放到我身上～">
+  <div class="g-chip" id="gChip" role="img" aria-label="昕怡">
     <video id="gVid" src="assets/hero-alpha.webm" muted playsinline preload="auto"></video>
   </div>
+  <!-- 人物说话：原视频音轨以 2 倍速烘焙，与 3 秒动画严格对齐 -->
+  <audio id="heroVoice" src="assets/hero-voice.mp3" preload="auto"></audio>
   <div class="g-bubble">
     <span id="gText">👋 Hi，我是昕怡！<br>点击地图上的<b>驿站</b>，逐站解锁我的故事吧～</span>
     <button class="g-x" id="guideClose" title="收起">×</button>
@@ -1377,6 +1379,66 @@ document.addEventListener("keydown",e=>{
   if(e.key==="Escape"){closeDrawer();closeModal();closeLb();}
 });
 
+/* ============================================================
+   人物说话：碰到（悬停 / 点一下）就开口
+   音频已用 atempo=2 烘焙成 3.06 秒，和 3 秒动画同步
+============================================================ */
+(function(){
+  const voice = document.getElementById("heroVoice");
+  if(!voice) return;
+  const AMB_FULL = 0.26, AMB_DUCK = 0.08;
+  let fadeTimer = null, lastAt = 0, blocked = false;
+
+  function duck(to, sec){
+    const s = window.__sfx;
+    if(s && s.duck) s.duck(to, sec);
+  }
+  function restoreAmb(){
+    const s = window.__sfx;
+    duck((s && s.AMB_BASE) || AMB_FULL, 0.7);
+  }
+
+  function speak(){
+    const s = window.__sfx;
+    if(s && s.on === false) return;              // 总开关关着就闭嘴
+    const now = performance.now();
+    if(now - lastAt < 260) return;               // 防抖：快速划过不重复触发
+    lastAt = now;
+    clearInterval(fadeTimer); fadeTimer = null;
+    try{
+      voice.pause();
+      voice.currentTime = 0;
+      voice.volume = 0.85;
+      voice.playbackRate = 1;                    // 倍速已烘焙进文件
+      const pr = voice.play();
+      /* 浏览器要求先有一次真实点击才允许出声；被拦下就先记着，点击后补播 */
+      if(pr && pr.catch) pr.catch(()=>{ blocked = true; });
+    }catch(e){ blocked = true; }
+    duck(AMB_DUCK, 0.25);                        // 说话时把溪流鸟鸣压低，让人声透出来
+  }
+  function hush(){
+    if(voice.paused) return;
+    clearInterval(fadeTimer);
+    const v0 = voice.volume, t0 = performance.now();
+    fadeTimer = setInterval(()=>{
+      const k = (performance.now() - t0) / 260;
+      if(k >= 1){ clearInterval(fadeTimer); fadeTimer = null; voice.pause(); restoreAmb(); return; }
+      try{ voice.volume = Math.max(0, v0 * (1 - k)); }catch(e){}
+    }, 25);
+  }
+
+  voice.addEventListener("ended", ()=>{ restoreAmb(); });
+  voice.addEventListener("pause", ()=>{ if(!fadeTimer) restoreAmb(); });
+
+  gChip.addEventListener("mouseenter", speak);
+  gChip.addEventListener("click", speak);
+  gChip.addEventListener("mouseleave", hush);
+  /* 浏览器拦了第一次自动播放：等用户真正点过一次页面，立刻补上这句台词 */
+  document.addEventListener("pointerdown", ()=>{
+    if(blocked){ blocked = false; setTimeout(speak, 60); }
+  }, {passive:true});
+})();
+
 /* ---- 导航高亮 ---- */
 const navAs = document.querySelectorAll(".nav-a");
 const secMap = [["spot-person",0],["map-anchor",1],["spot-next",3]];
@@ -1413,6 +1475,272 @@ document.addEventListener("keydown",e=>{
   if(e.key==="ArrowLeft")lbStep(-1);
   if(e.key==="ArrowRight")lbStep(1);
 });
+/* ============================================================
+   音效引擎 · Web Audio 实时合成（除开启音外无音频文件、无版权风险）
+   ① 开篇卷轴音：已按需求移除
+   ② 弹窗/抽屉：开启=真实采样 assets/pop-open.mp3；关闭=木鱼咔哒（中空木腔，非谐共振）
+   ③ 常驻背景：只留鸟鸣（溪流与微风已移除）
+   ④ 人物开口：assets/hero-voice.mp3（原视频音轨 2 倍速烘焙）
+============================================================ */
+(function () {
+  const LS_KEY = 'map-sound';
+  const lsGet = k => { try { return localStorage.getItem(k); } catch (e) { return null; } };
+  const lsSet = (k, v) => { try { localStorage.setItem(k, v); } catch (e) {} };
+  let on = lsGet(LS_KEY) !== 'off';                  // 默认开启（localStorage 在部分环境不可用，做了兜底）
+  let ctx = null, master, sfxBus, ambBus, verb, noiseBuf;
+  let started = false;
+  let birdTimer = null, lastSfx = 0;
+
+  /* ---------- 基础工具 ---------- */
+  function makeNoise(sec) {
+    const len = Math.floor(ctx.sampleRate * sec);
+    const b = ctx.createBuffer(1, len, ctx.sampleRate);
+    const d = b.getChannelData(0);
+    for (let i = 0; i < len; i++) d[i] = Math.random() * 2 - 1;
+    return b;
+  }
+  function makeIR(sec, decay) {                       // 合成一段脉冲响应做户外混响
+    const len = Math.floor(ctx.sampleRate * sec);
+    const b = ctx.createBuffer(2, len, ctx.sampleRate);
+    for (let c = 0; c < 2; c++) {
+      const d = b.getChannelData(c);
+      for (let i = 0; i < len; i++) d[i] = (Math.random() * 2 - 1) * Math.pow(1 - i / len, decay);
+    }
+    return b;
+  }
+  function lfo(rate, depth, param) {                  // 低频调制，让声音"活"起来
+    const o = ctx.createOscillator(); o.frequency.value = rate;
+    const g = ctx.createGain(); g.gain.value = depth;
+    o.connect(g); g.connect(param); o.start();
+    return o;
+  }
+  function chain() {                                  // 串联若干节点
+    const ns = [...arguments];
+    for (let i = 0; i < ns.length - 1; i++) ns[i].connect(ns[i + 1]);
+    return ns[ns.length - 1];
+  }
+
+  /* ---------- 初始化音频图 ---------- */
+  function build() {
+    const AC = window.AudioContext || window.webkitAudioContext;
+    if (!AC) return false;
+    ctx = new AC();
+    noiseBuf = makeNoise(4);
+
+    master = ctx.createGain(); master.gain.value = 0; master.connect(ctx.destination);
+
+    verb = ctx.createConvolver(); verb.buffer = makeIR(1.8, 2.4);
+    const verbOut = ctx.createGain(); verbOut.gain.value = 0.3;
+    verb.connect(verbOut); verbOut.connect(master);
+
+    sfxBus = ctx.createGain(); sfxBus.gain.value = 0.62;
+    sfxBus.connect(master); sfxBus.connect(verb);
+
+    ambBus = ctx.createGain(); ambBus.gain.value = AMB_BASE;   /* 只剩鸟鸣，抬一点免得太空 */
+    ambBus.connect(master); ambBus.connect(verb);
+    return true;
+  }
+
+  /* ---------- ③ 背景：只留鸟鸣（溪流与微风已按需求移除） ---------- */
+  function startAmbience() {
+    scheduleBird();
+  }
+
+  function birdNote(t, f, vol, pan) {
+    const o = ctx.createOscillator(); o.type = 'sine';
+    o.frequency.setValueAtTime(f * 0.72, t);
+    o.frequency.exponentialRampToValueAtTime(f * 1.2, t + 0.045);
+    o.frequency.exponentialRampToValueAtTime(f * 0.86, t + 0.115);
+    const g = ctx.createGain();
+    g.gain.setValueAtTime(0.0001, t);
+    g.gain.exponentialRampToValueAtTime(vol, t + 0.014);
+    g.gain.exponentialRampToValueAtTime(0.0001, t + 0.14);
+    o.connect(g);
+    if (ctx.createStereoPanner) {
+      const p = ctx.createStereoPanner(); p.pan.value = pan;
+      g.connect(p); p.connect(ambBus);
+    } else g.connect(ambBus);
+    o.start(t); o.stop(t + 0.18);
+  }
+  function scheduleBird() {
+    clearTimeout(birdTimer);
+    birdTimer = setTimeout(() => {
+      if (ctx && ctx.state === 'running' && on) {
+        const t = ctx.currentTime + 0.02;
+        const base = 1700 + Math.random() * 1500;
+        const pan = Math.random() * 1.6 - 0.8;
+        const n = 2 + Math.floor(Math.random() * 3);      // 一小串 2~4 声
+        const vol = 0.16 + Math.random() * 0.16;
+        for (let i = 0; i < n; i++) {
+          birdNote(t + i * (0.085 + Math.random() * 0.085),
+                   base * (0.9 + Math.random() * 0.25), vol, pan);
+        }
+      }
+      scheduleBird();
+    }, 2200 + Math.random() * 5200);                      // 2.2~7.4 秒不定时
+  }
+
+  /* ---------- ② 弹窗/抽屉：开启用真实采样，关闭仍是木鱼 ---------- */
+  /* 木鱼音高：不取十二平均律，只用几个略带差异的中低音，每次敲击微微不同，更像手敲 */
+  const MUYU = [392.0, 349.2, 440.0, 311.1, 466.2, 415.3];
+
+  /* 一记木鱼：① 木槌触木的极短瞬态噪声 → ② 中空木腔的非谐共振 → ③ 一点低频闷响收尾 */
+  function muyu(t, f, vol, bright) {
+    // ① 咔哒的"哒"：3ms 起音、45ms 就没了，bandpass 越靠上越脆
+    const n = ctx.createBufferSource(); n.buffer = noiseBuf;
+    const bp = ctx.createBiquadFilter();
+    bp.type = 'bandpass'; bp.frequency.value = f * (bright ? 3.6 : 2.8); bp.Q.value = 1.1;
+    const ng = ctx.createGain();
+    ng.gain.setValueAtTime(0.0001, t);
+    ng.gain.linearRampToValueAtTime(vol * 0.55, t + 0.003);
+    ng.gain.exponentialRampToValueAtTime(0.0001, t + 0.042);
+    chain(n, bp, ng, sfxBus); n.start(t); n.stop(t + 0.08);
+
+    // ② 木腔共振：木头不是谐波列，泛音比 1 : 2.42 : 4.13 才对；音高微微下滑是"tok"感的关键
+    [[1, 1], [2.42, 0.4], [4.13, 0.14]].forEach(([m, a], i) => {
+      const o = ctx.createOscillator(); o.type = 'sine';
+      const f0 = f * m;
+      o.frequency.setValueAtTime(f0 * 1.05, t);
+      o.frequency.exponentialRampToValueAtTime(f0 * 0.93, t + 0.085);
+      const g = ctx.createGain();
+      g.gain.setValueAtTime(0.0001, t);
+      g.gain.linearRampToValueAtTime(vol * a, t + 0.004);
+      g.gain.exponentialRampToValueAtTime(0.0001, t + 0.2 * (1 - i * 0.3));
+      chain(o, g, sfxBus); o.start(t); o.stop(t + 0.24);
+    });
+
+    // ③ 收尾的低频闷响，让声音"落在木头上"而不是飘着
+    const o2 = ctx.createOscillator(); o2.type = 'triangle';
+    o2.frequency.setValueAtTime(f * 0.52, t);
+    o2.frequency.exponentialRampToValueAtTime(f * 0.44, t + 0.09);
+    const g2 = ctx.createGain();
+    g2.gain.setValueAtTime(0.0001, t);
+    g2.gain.linearRampToValueAtTime(vol * 0.3, t + 0.005);
+    g2.gain.exponentialRampToValueAtTime(0.0001, t + 0.13);
+    chain(o2, g2, sfxBus); o2.start(t); o2.stop(t + 0.17);
+  }
+
+  /* 开启音：assets/pop-open.mp3（用户指定的真实采样）。页面一加载就抓，解锁后立刻解码 */
+  let openRaw = null, openBuf = null;
+  try {
+    fetch('assets/pop-open.mp3').then(r => r.arrayBuffer())
+      .then(a => { openRaw = a; if (ctx) decodeOpen(); }).catch(() => {});
+  } catch (e) {}
+  function decodeOpen() {
+    if (openBuf || !openRaw || !ctx) return;
+    try {
+      const p = ctx.decodeAudioData(openRaw.slice(0),
+        b => { openBuf = b; },                            // Safari 等老浏览器的回调写法
+        () => {});
+      if (p && p.then) p.then(b => { openBuf = b; }, () => {});
+    } catch (e) {}
+  }
+  function sfxOpen() {
+    const now = performance.now();
+    if (now - lastSfx < 90) return;                       // 防止"返回驿站"时开合音叠在一起
+    lastSfx = now;
+    if (!openBuf) { decodeOpen(); return; }               // 还没解码好就这次先不出声（下次就有了）
+    const t = ctx.currentTime;
+    const s = ctx.createBufferSource(); s.buffer = openBuf;
+    const g = ctx.createGain(); g.gain.value = 0.8;
+    chain(s, g, sfxBus); s.start(t);
+  }
+  /* 关闭音：保持原来的低闷木鱼，不动 */
+  function sfxClose() {
+    const t = ctx.currentTime;
+    muyu(t, MUYU[0] * 0.72, 0.26, false);
+  }
+
+  /* ---------- 压低背景（人物说话时让位给人声） ---------- */
+  const AMB_BASE = 0.38;
+  function duckAmb(to, sec) {
+    if (!ctx || !ambBus) return;
+    const t = ctx.currentTime;
+    ambBus.gain.cancelScheduledValues(t);
+    ambBus.gain.setValueAtTime(ambBus.gain.value, t);
+    ambBus.gain.linearRampToValueAtTime(to, t + sec);
+  }
+
+  /* ---------- 解锁（浏览器要求先有用户手势） ---------- */
+  function fadeMaster(to, sec) {
+    const t = ctx.currentTime;
+    master.gain.cancelScheduledValues(t);
+    master.gain.setValueAtTime(Math.max(master.gain.value, 0.0001), t);
+    master.gain.linearRampToValueAtTime(to, t + sec);
+  }
+  function unlock() {
+    if (!on) return;
+    if (!ctx && !build()) return;
+    if (ctx.state === 'suspended') ctx.resume();
+    const first = !started;
+    if (first) { started = true; startAmbience(); }
+    fadeMaster(1, first ? 1.4 : 0.6);      // 首次淡入慢一点，重新开启快一点
+    decodeOpen();                          // 有 AudioContext 了，把开启音解码好待用
+  }
+  ['pointerdown', 'touchstart', 'keydown'].forEach(ev =>
+    document.addEventListener(ev, unlock, { passive: true }));
+
+  /* ---------- 挂钩：弹窗 / 抽屉（开场卷轴音已按需求移除） ---------- */
+  [['modal', document.getElementById('modal')], ['drawer', document.getElementById('drawer')]]
+    .forEach(([, el]) => {
+      if (!el) return;
+      let was = el.classList.contains('open');
+      new MutationObserver(() => {
+        const is = el.classList.contains('open');
+        if (is === was) return;
+        was = is;
+        if (!started) return;
+        is ? sfxOpen() : sfxClose();
+      }).observe(el, { attributes: true, attributeFilter: ['class'] });
+    });
+
+  /* ---------- 开关按钮 ---------- */
+  const btn = document.createElement('button');
+  btn.id = 'sfxBtn';
+  btn.type = 'button';
+  btn.title = '音效开关';
+  btn.setAttribute('aria-label', '音效开关');
+  btn.style.cssText = [
+    'position:fixed', 'right:22px', 'bottom:22px', 'z-index:96',   /* 高于抽屉(90)/遮罩(85)，弹窗开着也能静音 */
+    'width:44px', 'height:44px', 'border-radius:50%', 'cursor:pointer',
+    'background:rgba(255,253,246,.94)', 'border:1.5px solid #c9bfa6',
+    'box-shadow:0 6px 15px rgba(70,96,78,.22)', 'font-size:19px', 'line-height:1',
+    'display:flex', 'align-items:center', 'justify-content:center',
+    'transition:transform .2s,opacity .2s', '-webkit-tap-highlight-color:transparent'
+  ].join(';');
+  function paint() {
+    btn.textContent = on ? '🔊' : '🔈';
+    btn.style.opacity = on ? '1' : '.55';
+  }
+  btn.addEventListener('click', e => {
+    e.stopPropagation();
+    on = !on;
+    lsSet(LS_KEY, on ? 'on' : 'off');
+    paint();
+    if (on) { unlock(); }
+    else {
+      const v = document.getElementById('heroVoice');
+      if (v && !v.paused) { try { v.pause(); v.currentTime = 0; } catch (e) {} }   // 静音时人物也闭嘴
+      duckAmb(AMB_BASE, 0.3);
+    }
+    if (!on && ctx) {
+      fadeMaster(0.0001, 0.35);
+      setTimeout(() => { if (!on && ctx && ctx.state === 'running') ctx.suspend(); }, 450);
+    }
+  });
+  btn.addEventListener('pointerdown', e => e.stopPropagation());
+  paint();
+  document.body.appendChild(btn);
+
+  /* ---------- 切到后台自动静音，回来再恢复 ---------- */
+  document.addEventListener('visibilitychange', () => {
+    if (!ctx) return;
+    if (document.hidden) { if (ctx.state === 'running') ctx.suspend(); }
+    else if (on && ctx.state === 'suspended') ctx.resume();
+  });
+
+  window.__sfx = { get on() { return on; }, get state() { return ctx && ctx.state; }, get started() { return started; }, get ctx() { return ctx; }, get vol() { return master && master.gain.value; }, get amb() { return ambBus && ambBus.gain.value; }, duck: duckAmb, AMB_BASE: AMB_BASE };
+})();
 </script>
 </body>
 </html>
